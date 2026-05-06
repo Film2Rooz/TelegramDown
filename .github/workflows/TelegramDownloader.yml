@@ -30,7 +30,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y curl jq zip openssl
 
-      - name: 📡 Get direct link and fix spaces
+      - name: 📡 Get direct link
         id: get_link
         run: |
           TELEGRAM_LINK="${{ github.event.inputs.telegram_link }}"
@@ -40,25 +40,25 @@ jobs:
           echo "═══════════════════════════════════════════════════════════════"
           
           RESPONSE=$(curl -s -X POST \
-            -H "User-Agent: Mozilla/5.0" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept: application/json" \
             -d "telegram_link=$TELEGRAM_LINK" \
             https://telegramdownloader.net/proxy.php)
           
-          RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
-          FILE_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
+          RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link // empty')
+          FILE_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name // empty')
           
           if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
-            echo "❌ Error: Could not get download link!"
+            echo "❌ Error: Could not get download link! The service might be blocking GitHub IPs."
+            echo "Response: $RESPONSE"
             exit 1
           fi
-          
-          # Convert spaces to dash in URL
-          CORRECTED_URL=$(echo "$RAW_URL" | sed 's/%20/-/g' | sed 's/ /-/g')
           
           echo "✅ Direct link received!"
           echo "📄 Original filename: $FILE_NAME"
           
-          echo "download_url=$CORRECTED_URL" >> $GITHUB_OUTPUT
+          # خروجی دادن لینک خام بدون دستکاری فاصله‌ها
+          echo "download_url=$RAW_URL" >> $GITHUB_OUTPUT
           echo "original_name=$FILE_NAME" >> $GITHUB_OUTPUT
 
       - name: ⬇️ Download file with duplicate check
@@ -95,12 +95,13 @@ jobs:
           echo "⬇️ Downloading: $FINAL_NAME"
           echo "═══════════════════════════════════════════════════════════════"
           
-          curl -L --progress-bar \
+          # اضافه شدن پارامتر -f برای توقف در صورت دریافت خطای سرور
+          curl -f -L --progress-bar \
             --max-time 7200 \
-            --retry 10 \
-            --retry-delay 10 \
+            --retry 5 \
+            --retry-delay 5 \
             -C - \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
             -H "Referer: https://telegramdownloader.net/" \
             -o "downloads/$FINAL_NAME" \
             "$URL"
@@ -190,57 +191,5 @@ jobs:
           
           TOTAL=${#NEW_FILES[@]}
           
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "✅ No new files to upload!"
-            exit 0
-          fi
-          
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "📦 Total new files to upload: $TOTAL"
-          echo "═══════════════════════════════════════════════════════════════"
-          
-          # Upload ONE file at a time
-          for (( i=0; i<TOTAL; i++ )); do
-            echo ""
-            echo "🚀 Uploading file $((i+1)) of $TOTAL: ${NEW_FILES[$i]}"
-            
-            git add "downloads/${NEW_FILES[$i]}"
-            git commit -m "Add ${NEW_FILES[$i]} [skip ci]"
-            
-            for attempt in 1 2 3; do
-              if git push origin main 2>&1; then
-                echo "   ✅ Uploaded successfully"
-                break
-              else
-                if [ $attempt -lt 3 ]; then
-                  echo "   ⚠️ Push failed, retry $attempt/3..."
-                  git reset --soft HEAD~1
-                  sleep 5
-                else
-                  echo "   ❌ Failed to upload ${NEW_FILES[$i]}"
-                  git reset --soft HEAD~1
-                fi
-              fi
-            done
-            
-            sleep 2
-          done
-          
-          echo ""
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "🎉 All $TOTAL new files uploaded successfully!"
-          echo ""
-          echo "📂 Uploaded files:"
-          ls -lh downloads/
-          echo "═══════════════════════════════════════════════════════════════"
+          if [ "$TOTAL" -eq
 
-      - name: 📋 Final report
-        if: always()
-        run: |
-          echo ""
-          echo "┌─────────────────────────────────────────────────────────────┐"
-          echo "│                   Download Final Report                    │"
-          echo "├─────────────────────────────────────────────────────────────┤"
-          echo "│ 🔗 Link: ${{ github.event.inputs.telegram_link }}"
-          echo "│ 📁 Path: ./downloads/"
-          echo "└─────────────────────────────────────────────────────────────┘"
