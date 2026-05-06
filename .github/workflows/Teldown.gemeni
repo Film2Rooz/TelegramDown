@@ -1,0 +1,201 @@
+name: Direct Telegram Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_link:
+        description: '🔗 Telegram post link (Public channels only)'
+        required: true
+        type: string
+      split_threshold_mb:
+        description: '📦 Maximum file size per part (MB)'
+        required: false
+        type: number
+        default: 90
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: 📂 Clone repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: 📦 Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyrogram tgcrypto
+
+      - name: 📝 Create Python Script
+        run: |
+          cat << 'EOF' > download.py
+          import os
+          import sys
+          import asyncio
+          from pyrogram import Client
+
+          api_id = os.environ.get("TG_API_ID")
+          api_hash = os.environ.get("TG_API_HASH")
+          bot_token = os.environ.get("TG_BOT_TOKEN")
+          link = os.environ.get("TELEGRAM_LINK")
+
+          if not all([api_id, api_hash, bot_token]):
+              print("❌ Error: Telegram API credentials are missing in GitHub Secrets!")
+              sys.exit(1)
+
+          # Parse the telegram link (e.g., https://t.me/TAndroidAPK/500)
+          try:
+              link = link.rstrip('/')
+              parts = link.split('/')
+              message_id = int(parts[-1])
+              chat_username = parts[-2]
+          except Exception as e:
+              print("❌ Error: Invalid Telegram link format. Use a public channel link.")
+              sys.exit(1)
+
+          async def main():
+              app = Client(
+                  "github_bot",
+                  api_id=int(api_id),
+                  api_hash=api_hash,
+                  bot_token=bot_token
+              )
+              
+              async with app:
+                  try:
+                      print(f"🔍 Searching for message {message_id} in @{chat_username}...")
+                      msg = await app.get_messages(chat_username, message_id)
+                      
+                      if msg.empty or not msg.media:
+                          print("❌ Error: Message not found or contains no downloadable file/media.")
+                          sys.exit(1)
+                      
+                      print("✅ File found! Starting download (this might take a while)...")
+                      
+                      # Create downloads folder
+                      os.makedirs("downloads", exist_ok=True)
+                      
+                      # Custom progress function
+                      async def progress(current, total):
+                          print(f"⬇️ Downloaded: {current * 100 / total:.1f}%", end="\r")
+
+                      file_path = await app.download_media(
+                          msg, 
+                          file_name="downloads/",
+                          progress=progress
+                      )
+                      print(f"\n✅ Download complete: {file_path}")
+                      
+                      # Write file info for next steps
+                      with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                          f.write(f"downloaded_path={file_path}\n")
+                          
+                  except Exception as e:
+                      print(f"\n❌ Telegram API Error: {e}")
+                      sys.exit(1)
+
+          asyncio.run(main())
+          EOF
+
+      - name: ⬇️ Download from Telegram directly
+        id: tg_download
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TELEGRAM_LINK: ${{ github.event.inputs.telegram_link }}
+        run: |
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "🔗 Extracting from: $TELEGRAM_LINK"
+          echo "═══════════════════════════════════════════════════════════════"
+          python download.py
+
+      - name: ✂️ Split large file (if needed)
+        if: github.event.inputs.split_threshold_mb != '0'
+        run: |
+          THRESHOLD="${{ github.event.inputs.split_threshold_mb }}"
+          FILEPATH="${{ steps.tg_download.outputs.downloaded_path }}"
+          LIMIT=$((THRESHOLD * 1024 * 1024))
+          FILE_SIZE=$(stat -c%s "$FILEPATH")
+          
+          if [ -n "$FILE_SIZE" ] && [ "$FILE_SIZE" -gt "$LIMIT" ]; then
+            echo "✂️ Splitting $(basename "$FILEPATH") into ${THRESHOLD}MB parts..."
+            cd downloads
+            FILENAME=$(basename "$FILEPATH")
+            zip -s "${THRESHOLD}m" "${FILENAME}.zip" -j "$FILENAME"
+            rm "$FILENAME"
+            cd ..
+          fi
+
+      - name: 🔄 Fix filenames (remove Persian/Arabic, special chars)
+        run: |
+          cd downloads
+          for file in *; do
+            [ -e "$file" ] || continue
+            EXT="${file##*.}"
+            if [[ "$EXT" == "$file" ]]; then EXT="bin"; fi
+            
+            if [[ "$file" =~ [^[:ascii:]] ]]; then
+              RANDOM_NAME=$(openssl rand -hex 8)
+              NEW_NAME="${RANDOM_NAME}.${EXT}"
+              mv "$file" "$NEW_NAME"
+              echo "   🌐 Renaming: $file -> $NEW_NAME"
+            else
+              CLEAN_NAME=$(echo "$file" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g')
+              if [ "$file" != "$CLEAN_NAME" ]; then
+                mv "$file" "$CLEAN_NAME"
+                echo "   📝 Cleaning: $file -> $CLEAN_NAME"
+              fi
+            fi
+          done
+          cd ..
+
+      - name: 📤 Upload to GitHub
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          if [ ! -d "downloads" ] || [ -z "$(ls -A downloads 2>/dev/null)" ]; then
+            echo "⚠️ No files to upload!"
+            exit 1
+          fi
+          
+          NEW_FILES=()
+          for file in downloads/*; do
+            filename=$(basename "$file")
+            if ! git ls-files --error-unmatch "downloads/$filename" &>/dev/null; then
+              NEW_FILES+=("$filename")
+            fi
+          done
+          
+          TOTAL=${#NEW_FILES[@]}
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "✅ No new files to upload!"
+            exit 0
+          fi
+          
+          for (( i=0; i<TOTAL; i++ )); do
+            echo "🚀 Uploading: ${NEW_FILES[$i]}"
+            git add "downloads/${NEW_FILES[$i]}"
+            git commit -m "Add ${NEW_FILES[$i]} [skip ci]"
+            for attempt in 1 2 3; do
+              if git push origin main 2>&1; then
+                echo "✅ Uploaded successfully"
+                break
+              else
+                if [ $attempt -lt 3 ]; then
+                  git reset --soft HEAD~1
+                  sleep 5
+                else
+                  git reset --soft HEAD~1
+                fi
+              fi
+            done
+          done
